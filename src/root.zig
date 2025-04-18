@@ -214,7 +214,7 @@ fn patterns_single(comptime TokenType: type, comptime token: Ast.Rule) []const P
         comptime var result_matchers: []const Ptk.ptk.Matcher = matchers(token.pattern[0]);
 
         for (token.pattern[1..]) |expr| {
-            comptime var new_result: []const Ptk.ptk.Matcher = matchers(token.pattern[0]);
+            comptime var new_result: []const Ptk.ptk.Matcher = &.{};
             const expr_matchers = matchers(expr);
 
             for (result_matchers) |prev_matcher| {
