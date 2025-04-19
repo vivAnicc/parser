@@ -26,8 +26,7 @@
     // modify the field.
     .dependencies = .{
         .parser_toolkit = .{
-            .url = "parser-toolkit/",
-            .hash = "parser_toolkit-0.1.0-baYGPehyNwGetdCFyhHp9Pc5ymeZPGaL767oYyoQg_3t",
+            .path = "parser-toolkit/",
         },
     },
     .fingerprint = 0x2fb2c3732be60365, // Changing this has security and trust implications.

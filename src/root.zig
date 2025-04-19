@@ -103,7 +103,7 @@ pub const Ast = struct {
                     }
 
                     break :OneOf &[_]Expr{.{ .one_of = options }};
-                }
+                },
             };
         }
 
@@ -143,7 +143,7 @@ fn accept_rule(comptime parser: *Ptk.Parser, data: *Data) AcceptError!Ast.Rule {
     errdefer parser.restoreState(state);
 
     // Will be set to false if 'token' is not found
-    const rule: ?Ptk.Tokenizer.Token = parser.accept(Ptk.ruleset.oneOf(.{.token, .word})) catch |err| switch (err) {
+    const rule: ?Ptk.Tokenizer.Token = parser.accept(Ptk.ruleset.oneOf(.{ .token, .word })) catch |err| switch (err) {
         error.EndOfStream => return error.Invalid,
         error.UnexpectedToken => null,
         else => @compileError("Syntax error"),
@@ -201,7 +201,7 @@ fn accept_exprs(comptime parser: *Ptk.Parser, data: *Data) AcceptError![]const A
 
                 const exprs = try accept_exprs(parser, data);
 
-                result = &.{.{ .one_of = &[_][]const Ast.Expr{result, exprs} }};
+                result = &.{.{ .one_of = &[_][]const Ast.Expr{ result, exprs } }};
             },
             else => {},
         }
@@ -232,7 +232,7 @@ fn accept_expr(comptime parser: *Ptk.Parser, data: *Data) AcceptError!Ast.Expr {
         },
         .literal => {
             const lit = try parser.accept(Ptk.ruleset.is(.literal));
-            return .{ .lit = lit.text[1..lit.text.len - 1] };
+            return .{ .lit = lit.text[1 .. lit.text.len - 1] };
         },
         .@"(" => {
             _ = try parser.accept(Ptk.ruleset.is(.@"("));
@@ -250,8 +250,7 @@ fn accept_expr(comptime parser: *Ptk.Parser, data: *Data) AcceptError!Ast.Expr {
 fn get_tokens(comptime rules: []const Ast.Rule) []const Ast.Rule {
     if (rules.len == 0) return &.{};
 
-    if (rules[0].token) return &[_]Ast.Rule{rules[0]} ++ get_tokens(rules[1..])
-    else return get_tokens(rules[1..]);
+    if (rules[0].token) return &[_]Ast.Rule{rules[0]} ++ get_tokens(rules[1..]) else return get_tokens(rules[1..]);
 }
 
 fn token_types(comptime tokens: []const Ast.Rule) []const std.builtin.Type.EnumField {
@@ -360,7 +359,7 @@ pub fn Parser(comptime rules: []const u8) type {
         .decls = &.{},
         .fields = enum_fields,
         .is_exhaustive = true,
-        .tag_type = std.meta.Int(.unsigned, @intCast(enum_fields.len)),
+        .tag_type = std.meta.Int(.unsigned, std.math.log2(enum_fields.len) + 1),
     };
     const TokenTypeT = @Type(.{ .@"enum" = token_type });
     const TokenizerT = Ptk.ptk.Tokenizer(TokenTypeT, patterns(TokenTypeT, tokens));
@@ -378,8 +377,102 @@ pub fn Parser(comptime rules: []const u8) type {
     return Result;
 }
 
+fn FieldType(comptime expr: Ast.Expr) ?type {
+    return switch (expr) {
+        .rule => |rule| *RuleNode(rule),
+        .lit => null,
+        .group => unreachable,
+        .one_of => |one_of| {
+            comptime var types: []const type = &.{};
+
+            for (one_of) |option| {
+                if (FieldTypeMul(option)) |t| {
+                    types = types ++ &[_]type{t};
+                } else {
+                    types = types ++ &[_]type{void};
+                }
+            }
+
+            comptime var enum_fields: [types.len]std.builtin.Type.EnumField = undefined;
+
+            for (types, 0..) |_, i| {
+                enum_fields[i] = std.builtin.Type.EnumField{
+                    .name = std.fmt.comptimePrint("{}", .{i}),
+                    .value = i,
+                };
+            }
+
+            const enum_t = std.builtin.Type.Enum{
+                .tag_type = std.meta.Int(.unsigned, std.math.log2(types.len) + 1),
+                .fields = &enum_fields,
+                .decls = &.{},
+                .is_exhaustive = true,
+            };
+
+            const Enum = @Type(.{ .@"enum" = enum_t });
+
+            comptime var union_fields: [types.len]std.builtin.Type.UnionField = undefined;
+
+            for (types, 0..) |t, i| {
+                union_fields[i] = std.builtin.Type.UnionField{
+                    .name = std.fmt.comptimePrint("{}", .{i}),
+                    .type = t,
+                    .alignment = @alignOf(t),
+                };
+            }
+
+            const union_t = std.builtin.Type.Union{
+                .fields = &union_fields,
+                .decls = &.{},
+                .layout = .auto,
+                .tag_type = Enum,
+            };
+
+            const Union = @Type(.{ .@"union" = union_t });
+            return Union;
+        },
+    };
+}
+
+fn FieldTypeMul(comptime exprs: []const Ast.Expr) ?type {
+    comptime var fields: []const std.builtin.Type.StructField = &.{};
+
+    comptime var idx = 0;
+
+    for (exprs) |expr| {
+        if (FieldType(expr)) |T| {
+            const field = std.builtin.Type.StructField{
+                .name = std.fmt.comptimePrint("{}", .{idx}),
+                .type = T,
+                .default_value_ptr = null,
+                .is_comptime = false,
+                .alignment = @alignOf(T),
+            };
+            idx += 1;
+
+            fields = fields ++ &[_]std.builtin.Type.StructField{field};
+        }
+    }
+
+    if (fields.len == 0) return null;
+
+    if (fields.len == 1) return fields[0].type;
+
+    const t = std.builtin.Type.Struct{
+        .layout = .auto,
+        .fields = fields,
+        .decls = &.{},
+        .is_tuple = false,
+    };
+
+    const Field = @Type(.{ .@"struct" = t });
+
+    return Field;
+}
+
 pub fn RuleNode(comptime rule: Ast.Rule) type {
     return struct {
         pub const name = rule.name;
+        fields: (FieldTypeMul(rule.pattern) orelse void),
     };
 }
