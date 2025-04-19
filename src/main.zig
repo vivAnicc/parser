@@ -16,6 +16,7 @@ pub fn main() !void {
     defer gpa.allocator().free(data);
 
     var tokenizer = Parser.Tokenizer.init(data, file_name);
+    errdefer std.debug.print("{s}\n", .{tokenizer.source[tokenizer.offset..]});
 
     while (try tokenizer.next()) |token| {
         std.debug.print("{s}: '{s}'\n", .{@tagName(token.type), token.text});

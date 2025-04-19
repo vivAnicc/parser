@@ -13,6 +13,8 @@ pub fn build(b: *std.Build) void {
     const ptk = b.dependency("parser_toolkit", .{});
     lib_mod.addImport("ptk", ptk.module("parser-toolkit"));
 
+    b.getInstallStep().dependOn(ptk.builder.getInstallStep());
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

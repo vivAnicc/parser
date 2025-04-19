@@ -9,10 +9,14 @@ const Ptk = struct {
         whitespace,
 
         token,
+        word,
         kw_whitespace,
         identifier,
         @"::=",
         @";",
+        @"|",
+        @"(",
+        @")",
         literal,
     };
 
@@ -21,11 +25,15 @@ const Ptk = struct {
     pub const Tokenizer = ptk.Tokenizer(TokenType, &[_]Pattern{
         .create(.whitespace, ptk.matchers.whitespace),
 
-        .create(.token, ptk.matchers.literal("token")),
-        .create(.kw_whitespace, ptk.matchers.literal("whitespace")),
+        .create(.token, ptk.matchers.word("token")),
+        .create(.word, ptk.matchers.word("word")),
+        .create(.kw_whitespace, ptk.matchers.word("whitespace")),
         .create(.identifier, ptk.matchers.identifier),
         .create(.@"::=", ptk.matchers.literal("::=")),
         .create(.@";", ptk.matchers.literal(";")),
+        .create(.@"|", ptk.matchers.literal("|")),
+        .create(.@"(", ptk.matchers.literal("(")),
+        .create(.@")", ptk.matchers.literal(")")),
         .create(.literal, ptk.matchers.sequenceOf(.{
             ptk.matchers.literal("\""),
             ptk.matchers.takeNoneOf("\""),
@@ -63,6 +71,7 @@ const Ptk = struct {
 
 pub const Ast = struct {
     pub const Rule = struct {
+        word: bool = false,
         token: bool,
         name: []const u8,
         pattern: []const Expr,
@@ -70,7 +79,36 @@ pub const Ast = struct {
     pub const Expr = union(enum) {
         rule: Rule,
         lit: []const u8,
+        group: []const Expr,
+        one_of: []const []const Expr,
     };
+
+    fn optimize_exprs(comptime exprs: []const Expr) []const Expr {
+        comptime var result: []const Expr = &.{};
+
+        for (exprs) |expr| {
+            result = result ++ switch (expr) {
+                .rule, .lit => &[_]Expr{expr},
+                .group => |group| optimize_exprs(group),
+                .one_of => |one_of| OneOf: {
+                    comptime var options: []const []const Expr = &.{};
+
+                    for (one_of) |option| {
+                        const res = optimize_exprs(option);
+                        if (res.len == 1 and res[0] == .one_of) {
+                            option = options ++ res[0].one_of;
+                        } else {
+                            options = options ++ &[_][]const Expr{res};
+                        }
+                    }
+
+                    break :OneOf &[_]Expr{.{ .one_of = options }};
+                }
+            };
+        }
+
+        return result;
+    }
 };
 
 fn parse_rules(comptime rules: []const u8) []const Ast.Rule {
@@ -105,32 +143,38 @@ fn accept_rule(comptime parser: *Ptk.Parser, data: *Data) AcceptError!Ast.Rule {
     errdefer parser.restoreState(state);
 
     // Will be set to false if 'token' is not found
-    comptime var token = true;
-    _ = parser.accept(Ptk.ruleset.is(.token)) catch |err| switch (err) {
+    const rule: ?Ptk.Tokenizer.Token = parser.accept(Ptk.ruleset.oneOf(.{.token, .word})) catch |err| switch (err) {
         error.EndOfStream => return error.Invalid,
-        error.UnexpectedToken => token = false,
+        error.UnexpectedToken => null,
         else => @compileError("Syntax error"),
     };
+
+    var token = false;
+    var word = false;
+
+    if (rule) |r| {
+        switch (r.type) {
+            .token => token = true,
+            .word => {
+                token = true;
+                word = true;
+            },
+            else => unreachable,
+        }
+    }
 
     const name = try parser.accept(Ptk.ruleset.is(.identifier));
     _ = try parser.accept(Ptk.ruleset.is(.@"::="));
 
-    comptime var exprs: []const Ast.Expr = &.{};
-
-    while ((parser.peek() catch @compileError("Syntax error") orelse @compileError("Syntax error")).type != .@";") {
-        const expr = accept_expr(parser, data) catch |err| switch (err) {
-            error.Invalid => @compileError("Invalid expression start"),
-            else => return err,
-        };
-        exprs = exprs ++ &[_]Ast.Expr{expr};
-    }
+    const exprs = try accept_exprs(parser, data);
 
     _ = try parser.accept(Ptk.ruleset.is(.@";"));
 
     return Ast.Rule{
+        .word = word,
         .token = token,
         .name = name.text,
-        .pattern = exprs,
+        .pattern = Ast.optimize_exprs(exprs),
     };
 }
 
@@ -140,6 +184,39 @@ fn get_rule(comptime name: []const u8, data: *Data) Ast.Rule {
             break rule;
         }
     } else @compileError("Undefined rule: " ++ name);
+}
+
+fn accept_exprs(comptime parser: *Ptk.Parser, data: *Data) AcceptError![]const Ast.Expr {
+    const state = parser.saveState();
+    errdefer parser.restoreState(state);
+
+    comptime var result: []const Ast.Expr = &.{try accept_expr(parser, data)};
+
+    while (true) {
+        const next: Ptk.Token = try parser.peek() orelse break;
+
+        switch (next.type) {
+            .@"|" => {
+                _ = try parser.accept(Ptk.ruleset.is(.@"|"));
+
+                const exprs = try accept_exprs(parser, data);
+
+                result = &.{.{ .one_of = &[_][]const Ast.Expr{result, exprs} }};
+            },
+            else => {},
+        }
+
+        const expr: ?Ast.Expr = accept_expr(parser, data) catch |err| switch (err) {
+            error.Invalid => null,
+            else => return err,
+        };
+
+        if (expr) |e| {
+            result = result ++ &[_]Ast.Expr{e};
+        } else break;
+    }
+
+    return result;
 }
 
 fn accept_expr(comptime parser: *Ptk.Parser, data: *Data) AcceptError!Ast.Expr {
@@ -156,6 +233,15 @@ fn accept_expr(comptime parser: *Ptk.Parser, data: *Data) AcceptError!Ast.Expr {
         .literal => {
             const lit = try parser.accept(Ptk.ruleset.is(.literal));
             return .{ .lit = lit.text[1..lit.text.len - 1] };
+        },
+        .@"(" => {
+            _ = try parser.accept(Ptk.ruleset.is(.@"("));
+
+            const exprs = try accept_exprs(parser, data);
+
+            _ = try parser.accept(Ptk.ruleset.is(.@")"));
+
+            return .{ .group = exprs };
         },
         else => return error.Invalid,
     }
@@ -200,20 +286,11 @@ fn patterns(comptime TokenType: type, comptime tokens: []const Ast.Rule) []const
     return result;
 }
 
-fn patterns_single(comptime TokenType: type, comptime token: Ast.Rule) []const Ptk.ptk.Pattern(TokenType) {
-    const Pattern = Ptk.ptk.Pattern(TokenType);
-    const token_type = std.meta.stringToEnum(TokenType, token.name).?;
+fn sequence_exprs(comptime exprs: []const Ast.Expr) []const Ptk.ptk.Matcher {
+    comptime var result_matchers = matchers(exprs[0]);
 
-    if (token.pattern.len == 1) {
-        comptime var result: []const Pattern = &.{};
-        inline for (matchers(token.pattern[0])) |matcher| {
-            result = result ++ &[_]Pattern{.create(token_type, matcher)};
-        }
-        return result;
-    } else {
-        comptime var result_matchers: []const Ptk.ptk.Matcher = matchers(token.pattern[0]);
-
-        for (token.pattern[1..]) |expr| {
+    if (exprs.len > 1) {
+        for (exprs[1..]) |expr| {
             comptime var new_result: []const Ptk.ptk.Matcher = &.{};
             const expr_matchers = matchers(expr);
 
@@ -228,18 +305,44 @@ fn patterns_single(comptime TokenType: type, comptime token: Ast.Rule) []const P
 
             result_matchers = new_result;
         }
-
-        comptime var result: []const Pattern = &.{};
-        inline for (result_matchers) |matcher| {
-            result = result ++ &[_]Pattern{.create(token_type, matcher)};
-        }
-        return result;
     }
+
+    return result_matchers;
+}
+
+fn patterns_single(comptime TokenType: type, comptime token: Ast.Rule) []const Ptk.ptk.Pattern(TokenType) {
+    const Pattern = Ptk.ptk.Pattern(TokenType);
+    const token_type = std.meta.stringToEnum(TokenType, token.name).?;
+
+    comptime var result_matchers = sequence_exprs(token.pattern);
+
+    if (token.word) {
+        comptime var new_result: []const Ptk.ptk.Matcher = &.{};
+
+        for (result_matchers) |matcher| {
+            new_result = new_result ++ &[_]Ptk.ptk.Matcher{Ptk.ptk.matchers.sequenceOf(.{
+                matcher,
+                Ptk.ptk.matchers.word(""),
+            })};
+        }
+
+        result_matchers = new_result;
+    }
+
+    comptime var result: []const Pattern = &.{};
+
+    inline for (result_matchers) |matcher| {
+        result = result ++ &[_]Pattern{.create(token_type, matcher)};
+    }
+
+    return result;
 }
 
 fn matchers(comptime expr: Ast.Expr) []const Ptk.ptk.Matcher {
     return switch (expr) {
         .lit => |lit| &[_]Ptk.ptk.Matcher{Ptk.ptk.matchers.literal(lit)},
+        .group => |group| sequence_exprs(group),
+        .one_of => |one_of| sequence_exprs(one_of[0]) ++ sequence_exprs(one_of[1]),
 
         else => @compileError(@tagName(expr) ++ " is not supported in tokens"),
     };
@@ -262,9 +365,21 @@ pub fn Parser(comptime rules: []const u8) type {
     const TokenTypeT = @Type(.{ .@"enum" = token_type });
     const TokenizerT = Ptk.ptk.Tokenizer(TokenTypeT, patterns(TokenTypeT, tokens));
 
-    return struct {
+    const Result = struct {
         pub const TokenType = TokenTypeT;
         pub const Pattern = Ptk.ptk.Pattern(TokenType);
         pub const Tokenizer = TokenizerT;
+        pub const ParserCore = Ptk.ptk.ParserCore(Tokenizer, .{.whitespace});
+        pub const ruleset = Ptk.ptk.RuleSet(TokenType);
+
+        core: ParserCore,
+    };
+
+    return Result;
+}
+
+pub fn RuleNode(comptime rule: Ast.Rule) type {
+    return struct {
+        pub const name = rule.name;
     };
 }
